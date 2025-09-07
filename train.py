@@ -160,7 +160,7 @@ def main():
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
         logging_steps=args.log_steps,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=args.save_steps,
         save_steps=args.save_steps,
         save_total_limit=2,
