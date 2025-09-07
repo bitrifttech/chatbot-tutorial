@@ -15,11 +15,13 @@ Notes:
 import os
 import json
 import argparse
+import time
+import math
 import torch
 from torch.utils.data import Dataset
 from transformers import (
     GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast,
-    Trainer, TrainingArguments
+    Trainer, TrainingArguments, TrainerCallback
 )
 
 # -------- Dataset utilities --------
@@ -95,6 +97,83 @@ def gpt2_cfg(name: str):
             attn_pdrop=0.1, resid_pdrop=0.1, embd_pdrop=0.1
         )
     raise ValueError(f"Unknown config name: {name}")
+
+class ProgressLoggerCallback(TrainerCallback):
+    def __init__(self, seq_len: int):
+        self.seq_len = seq_len
+        self.last_log_time = None
+        self.last_logged_step = 0
+        self._tokens_per_step_cache = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.last_log_time = time.perf_counter()
+        self.last_logged_step = state.global_step
+        if getattr(args, "process_index", 0) == 0:
+            print(
+                f"Training started: world_size={args.world_size}, "
+                f"per_device_batch_size={args.per_device_train_batch_size}, "
+                f"grad_accum={args.gradient_accumulation_steps}, seq_len={self.seq_len}")
+
+    def _tokens_per_optimizer_step(self, args):
+        if self._tokens_per_step_cache is None:
+            effective_batch = (
+                args.per_device_train_batch_size
+                * args.gradient_accumulation_steps
+                * max(1, args.world_size)
+            )
+            self._tokens_per_step_cache = effective_batch * self.seq_len
+        return self._tokens_per_step_cache
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if getattr(args, "process_index", 0) != 0:
+            return
+        now = time.perf_counter()
+        if self.last_log_time is None:
+            self.last_log_time = now
+        steps_since = max(1, state.global_step - self.last_logged_step)
+        elapsed = now - self.last_log_time
+        avg_step_time = elapsed / steps_since if steps_since > 0 else 0.0
+
+        tok_per_step = self._tokens_per_optimizer_step(args)
+        tok_per_sec = (tok_per_step / avg_step_time) if avg_step_time > 0 else float("inf")
+        ex_per_sec = ((tok_per_step / self.seq_len) / avg_step_time) if avg_step_time > 0 else float("inf")
+
+        loss = None
+        lr = None
+        if logs is not None:
+            loss = logs.get("loss", logs.get("train_loss", None))
+            lr = logs.get("learning_rate", None)
+
+        msg = f"[step {state.global_step}/{args.max_steps}]"
+        if loss is not None:
+            msg += f" loss={loss:.4f}"
+        if lr is not None:
+            msg += f" lr={lr:.6g}"
+        msg += f" t={avg_step_time*1000:.0f}ms ex/s={ex_per_sec:.1f} tok/s={tok_per_sec:.0f}"
+        print(msg, flush=True)
+
+        self.last_log_time = now
+        self.last_logged_step = state.global_step
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if getattr(args, "process_index", 0) != 0:
+            return
+        metrics = metrics or {}
+        eval_loss = metrics.get("eval_loss", None)
+        if eval_loss is not None:
+            try:
+                ppl = math.exp(eval_loss)
+                print(f"[eval step {state.global_step}] eval_loss={eval_loss:.4f} ppl={ppl:.2f}", flush=True)
+            except Exception:
+                print(f"[eval step {state.global_step}] eval_loss={eval_loss:.4f}", flush=True)
+        else:
+            print(f"[eval step {state.global_step}] metrics: {metrics}", flush=True)
+
+    def on_save(self, args, state, control, **kwargs):
+        if getattr(args, "process_index", 0) != 0:
+            return
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        print(f"[checkpoint] saved to {ckpt_dir}", flush=True)
 
 # -------- Argument parser --------
 
@@ -185,6 +264,8 @@ def main():
         eval_dataset=val_ds,
         data_collator=data_collator
     )
+
+    trainer.add_callback(ProgressLoggerCallback(seq_len=args.seq_len))
 
     trainer.train()
     trainer.save_state()
