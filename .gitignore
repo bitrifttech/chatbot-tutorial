@@ -1,0 +1,67 @@
+# OS artifacts
+.DS_Store
+.DS_Store?
+Icon?
+Thumbs.db
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Package/build artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+wheels/
+
+# Logs and debugging
+logs/
+*.log
+*.out
+*.err
+
+# Coverage/testing
+.coverage
+.coverage.*
+.cache/
+pytest_cache/
+.pytest_cache/
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Data and model artifacts (keep placeholders)
+data/*
+!data/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+runs/
+wandb/
+mlruns/
+outputs/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Hugging Face caches (if accidentally added under repo)
+huggingface/
+hf_cache/
+transformers_cache/
