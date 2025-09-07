@@ -43,8 +43,10 @@ If you are not starting from any pretrained model, use this two-stage pipeline:
 ### Stage A — General Causal-LM Pretraining on Raw Text
 - Prepare a large general text corpus (e.g., OpenWebText/C4 subsets):
 ```bash
-python prep_text_corpus.py --dataset openwebtext --out_dir data_pretrain
+python prep_text_corpus.py --dataset Skylion007/openwebtext --out_dir data_pretrain
 ```
+Note: With `datasets>=3`, legacy script-based dataset ids like `openwebtext` were removed. The script will automatically
+remap `--dataset openwebtext` to `Skylion007/openwebtext` for convenience.
 - Train with full-token loss (disable assistant-only loss):
 ```bash
 nohup python -u train.py \

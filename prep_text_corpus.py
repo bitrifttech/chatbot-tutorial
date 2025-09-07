@@ -4,8 +4,8 @@ prep_text_corpus.py
 Prepare raw text corpora into token ID JSONL for Stage A causal-LM pretraining (from scratch).
 
 Usage examples:
-  python prep_text_corpus.py --dataset openwebtext --out_dir data_pretrain
-  python prep_text_corpus.py --dataset allenai/c4 --train_split train[:99%] --val_split train[-1%:] --out_dir data_pretrain_c4
+  python prep_text_corpus.py --dataset Skylion007/openwebtext --out_dir data_pretrain
+  python prep_text_corpus.py --dataset allenai/c4 --dataset_config en --train_split train[:99%] --val_split train[-1%:] --out_dir data_pretrain_c4
 
 Notes:
 - Outputs two files in --out_dir:
@@ -25,12 +25,14 @@ from transformers import GPT2TokenizerFast
 
 def build_argparser():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", type=str, default="openwebtext",
-                   help="HF dataset name or path, e.g., 'openwebtext' or 'allenai/c4'")
+    p.add_argument("--dataset", type=str, default="Skylion007/openwebtext",
+                   help="HF dataset name or path, e.g., 'Skylion007/openwebtext' or 'allenai/c4'")
     p.add_argument("--train_split", type=str, default="train[:99%]")
     p.add_argument("--val_split", type=str, default="train[-1%:]")
     p.add_argument("--text_column", type=str, default="",
                    help="Name of the text column. If empty, will try 'text' then fall back to the first string column.")
+    p.add_argument("--dataset_config", type=str, default="",
+                   help="Optional dataset config/name (e.g., for 'allenai/c4' use 'en').")
     p.add_argument("--out_dir", type=str, default="data_pretrain")
     p.add_argument("--sample_pct", type=int, default=100,
                    help="Percentage of split to keep (for quick tests).")
@@ -86,15 +88,24 @@ def main():
     args = build_argparser().parse_args()
     ensure_dir(args.out_dir)
 
+    # Map legacy dataset IDs to Hub repos since datasets>=3 removed script-based datasets
+    if args.dataset.strip().lower() == "openwebtext":
+        print("Remapping 'openwebtext' to 'Skylion007/openwebtext' (datasets>=3 removed script-based datasets).")
+        args.dataset = "Skylion007/openwebtext"
+
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     # Keep vocab consistent with Stage B (role tokens exist, even if unused here)
     tokenizer.add_special_tokens({"additional_special_tokens": ["<|system|>", "<|user|>", "<|assistant|>"]})
     if tokenizer.eos_token_id is None:
         tokenizer.eos_token = "<|endoftext|>"
 
-    print(f"Loading dataset: {args.dataset}")
-    train_ds = load_dataset(args.dataset, split=args.train_split)
-    val_ds = load_dataset(args.dataset, split=args.val_split)
+    print(f"Loading dataset: {args.dataset}" + (f" (config={args.dataset_config})" if args.dataset_config else ""))
+    if args.dataset_config:
+        train_ds = load_dataset(args.dataset, args.dataset_config, split=args.train_split)
+        val_ds = load_dataset(args.dataset, args.dataset_config, split=args.val_split)
+    else:
+        train_ds = load_dataset(args.dataset, split=args.train_split)
+        val_ds = load_dataset(args.dataset, split=args.val_split)
 
     text_col_train = pick_text_column(train_ds, args.text_column)
     text_col_val = pick_text_column(val_ds, args.text_column or text_col_train)
