@@ -261,6 +261,10 @@ def main():
         model = GPT2LMHeadModel.from_pretrained(args.init_model_dir)
     else:
         config = gpt2_cfg(args.cfg)
+        # Ensure positional embeddings cover the requested sequence length
+        # This allows increasing context window (e.g., --seq_len 2048)
+        if hasattr(config, "n_positions") and args.seq_len > config.n_positions:
+            config.n_positions = args.seq_len
         model = GPT2LMHeadModel(config)
     model.resize_token_embeddings(len(tokenizer))
 
