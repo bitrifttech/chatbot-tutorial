@@ -49,7 +49,7 @@ htmlcov/
 data/*
 !data/.gitkeep
 # Ignore any root-level directories starting with 'data' (e.g., data_pretrain/, data_pretrain_wikipedia_en_50/)
-/data*/
+/data*/**
 !/data*/.gitkeep
 checkpoints/*
 !checkpoints/.gitkeep
