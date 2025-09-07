@@ -31,27 +31,61 @@ def read_token_id_jsonl(path):
         for line in f:
             yield json.loads(line)  # each is a list[int]
 
-def pack_sequences(token_lists, seq_len, eos_id):
+def pack_sequences(token_lists, seq_len, eos_id, assistant_token_id=None, assistant_only_loss=False):
     """
     Concatenate lists of token IDs, split into equal blocks of seq_len.
-    Remainders are dropped (simple & effective).
+    If assistant_only_loss=True, mask labels outside assistant responses by setting them to -100.
+    Assistant span is considered the tokens after the <|assistant|> token up to the next EOS.
     """
     buffer = []
+    mask_buffer = []  # True if token belongs to assistant content
     for ids in token_lists:
         if not ids or ids[-1] != eos_id:
             ids = ids + [eos_id]
+
+        if assistant_only_loss and assistant_token_id is not None:
+            inside = False
+            amask = []
+            for t in ids:
+                if t == assistant_token_id:
+                    # Do not compute loss on the <|assistant|> marker itself
+                    amask.append(False)
+                    inside = True
+                elif t == eos_id:
+                    amask.append(False)
+                    inside = False
+                else:
+                    amask.append(inside)
+        else:
+            amask = [True] * len(ids)
+
         buffer.extend(ids)
+        mask_buffer.extend(amask)
+
         while len(buffer) >= seq_len + 1:
             x = buffer[:seq_len]
             y = buffer[1:seq_len+1]
-            yield (x, y)
+            m = mask_buffer[1:seq_len+1]
+            # Mask labels where the target token is not assistant content
+            labels = [yt if mask else -100 for yt, mask in zip(y, m)]
+            yield (x, labels)
             buffer = buffer[seq_len:]
+            mask_buffer = mask_buffer[seq_len:]
 
 class PackedLMDataset(Dataset):
-    def __init__(self, token_jsonl_path, tokenizer, seq_len):
+    def __init__(self, token_jsonl_path, tokenizer, seq_len, assistant_only_loss: bool):
         self.seq_len = seq_len
         eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 50256
-        pairs = list(pack_sequences(read_token_id_jsonl(token_jsonl_path), seq_len, eos_id))
+        assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
+        pairs = list(
+            pack_sequences(
+                read_token_id_jsonl(token_jsonl_path),
+                seq_len,
+                eos_id,
+                assistant_token_id=assistant_id,
+                assistant_only_loss=assistant_only_loss,
+            )
+        )
         self.inputs = torch.tensor([p[0] for p in pairs], dtype=torch.long)
         self.labels = torch.tensor([p[1] for p in pairs], dtype=torch.long)
 
@@ -183,6 +217,8 @@ def build_argparser():
     p.add_argument("--train_file", type=str, default="train_tokenized.jsonl")
     p.add_argument("--val_file", type=str, default="val_tokenized.jsonl")
     p.add_argument("--model_dir", type=str, default="checkpoints/400m")
+    p.add_argument("--init_model_dir", type=str, default="",
+                   help="Optional: path to a directory of a previously trained model to initialize from (Stage B)")
     p.add_argument("--cfg", type=str, default="baseline_355m", choices=["small_test", "baseline_355m", "heavier_420m"])
     p.add_argument("--seq_len", type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=2, help="Per-device batch size.")
@@ -192,6 +228,13 @@ def build_argparser():
     p.add_argument("--max_steps", type=int, default=100000)
     p.add_argument("--save_steps", type=int, default=1000)
     p.add_argument("--log_steps", type=int, default=100)
+    p.add_argument("--weight_decay", type=float, default=0.1)
+    # Assistant-only loss toggles
+    p.add_argument("--assistant_only_loss", dest="assistant_only_loss", action="store_true",
+                   help="Compute loss only on assistant tokens (Stage B SFT).")
+    p.add_argument("--no_assistant_only_loss", dest="assistant_only_loss", action="store_false",
+                   help="Use full-token loss (Stage A pretraining).")
+    p.set_defaults(assistant_only_loss=True)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--use_flash_attn", action="store_true", help="Only if installed & supported.")
@@ -209,12 +252,16 @@ def main():
 
     train_path = os.path.join(args.data_dir, args.train_file)
     val_path = os.path.join(args.data_dir, args.val_file)
-    train_ds = PackedLMDataset(train_path, tokenizer, args.seq_len)
-    val_ds = PackedLMDataset(val_path, tokenizer, args.seq_len)
+    train_ds = PackedLMDataset(train_path, tokenizer, args.seq_len, args.assistant_only_loss)
+    val_ds = PackedLMDataset(val_path, tokenizer, args.seq_len, args.assistant_only_loss)
     print(f"Train examples: {len(train_ds)} | Val examples: {len(val_ds)} at seq_len={args.seq_len}")
 
-    config = gpt2_cfg(args.cfg)
-    model = GPT2LMHeadModel(config)
+    if args.init_model_dir and os.path.isdir(args.init_model_dir):
+        print(f"Initializing model from {args.init_model_dir}")
+        model = GPT2LMHeadModel.from_pretrained(args.init_model_dir)
+    else:
+        config = gpt2_cfg(args.cfg)
+        model = GPT2LMHeadModel(config)
     model.resize_token_embeddings(len(tokenizer))
 
     if args.gradient_checkpointing:
@@ -249,6 +296,7 @@ def main():
         report_to="tensorboard",
         bf16=bf16,
         fp16=(not bf16) and fp16,
+        weight_decay=args.weight_decay,
         optim="adamw_bnb_8bit",
         dataloader_num_workers=2
     )
