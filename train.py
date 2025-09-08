@@ -18,7 +18,7 @@ import argparse
 import time
 import math
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from transformers import (
     GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast,
     Trainer, TrainingArguments, TrainerCallback
@@ -98,6 +98,63 @@ class PackedLMDataset(Dataset):
             "labels": self.labels[idx],
             "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
         }
+
+class PackedLMIterableDataset(IterableDataset):
+    """
+    Stream tokenized JSONL from disk and pack on-the-fly into fixed-length blocks.
+    Avoids loading the entire corpus into RAM.
+    """
+    def __init__(self, token_jsonl_path, tokenizer, seq_len, assistant_only_loss: bool):
+        super().__init__()
+        self.token_jsonl_path = token_jsonl_path
+        self.seq_len = seq_len
+        self.eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 50256
+        self.assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
+        self.assistant_only_loss = assistant_only_loss
+
+    def _pack_stream(self):
+        buffer = []
+        mask_buffer = []
+        with open(self.token_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                ids = json.loads(line)
+                if not ids or ids[-1] != self.eos_id:
+                    ids = ids + [self.eos_id]
+
+                if self.assistant_only_loss and self.assistant_id is not None:
+                    inside = False
+                    amask = []
+                    for t in ids:
+                        if t == self.assistant_id:
+                            amask.append(False)
+                            inside = True
+                        elif t == self.eos_id:
+                            amask.append(False)
+                            inside = False
+                        else:
+                            amask.append(inside)
+                else:
+                    amask = [True] * len(ids)
+
+                buffer.extend(ids)
+                mask_buffer.extend(amask)
+
+                while len(buffer) >= self.seq_len + 1:
+                    x = buffer[:self.seq_len]
+                    y = buffer[1:self.seq_len+1]
+                    m = mask_buffer[1:self.seq_len+1]
+                    labels = [yt if mask else -100 for yt, mask in zip(y, m)]
+                    yield (
+                        torch.tensor(x, dtype=torch.long),
+                        torch.tensor(labels, dtype=torch.long),
+                        torch.ones(self.seq_len, dtype=torch.long),
+                    )
+                    buffer = buffer[self.seq_len:]
+                    mask_buffer = mask_buffer[self.seq_len:]
+
+    def __iter__(self):
+        for x, labels, attn in self._pack_stream():
+            yield {"input_ids": x, "labels": labels, "attention_mask": attn}
 
 # -------- Model configs (~400M target) --------
 
@@ -239,6 +296,7 @@ def build_argparser():
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--use_flash_attn", action="store_true", help="Only if installed & supported.")
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    p.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (0 recommended for streaming).")
     return p
 
 def main():
@@ -252,9 +310,10 @@ def main():
 
     train_path = os.path.join(args.data_dir, args.train_file)
     val_path = os.path.join(args.data_dir, args.val_file)
-    train_ds = PackedLMDataset(train_path, tokenizer, args.seq_len, args.assistant_only_loss)
-    val_ds = PackedLMDataset(val_path, tokenizer, args.seq_len, args.assistant_only_loss)
-    print(f"Train examples: {len(train_ds)} | Val examples: {len(val_ds)} at seq_len={args.seq_len}")
+    # Stream datasets to avoid loading entire corpus into RAM
+    train_ds = PackedLMIterableDataset(train_path, tokenizer, args.seq_len, args.assistant_only_loss)
+    val_ds = PackedLMIterableDataset(val_path, tokenizer, args.seq_len, args.assistant_only_loss)
+    print(f"Streaming datasets: train={train_path} val={val_path} seq_len={args.seq_len}")
 
     if args.init_model_dir and os.path.isdir(args.init_model_dir):
         print(f"Initializing model from {args.init_model_dir}")
@@ -302,8 +361,12 @@ def main():
         fp16=(not bf16) and fp16,
         weight_decay=args.weight_decay,
         optim="adamw_bnb_8bit",
-        dataloader_num_workers=2
+        dataloader_num_workers=args.num_workers
     )
+
+    # Log precision and attention implementation
+    attn_impl = getattr(model.config, "_attn_implementation", "eager")
+    print(f"Precision: bf16={targs.bf16} fp16={targs.fp16} | Attention: {attn_impl} | Workers: {args.num_workers}")
 
     def data_collator(features):
         batch = {}
